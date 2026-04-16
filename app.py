@@ -1,21 +1,14 @@
-
 import os
 import re
 import logging
 import tempfile
 import asyncio
 from pathlib import Path
-from typing import List, Tuple
+from urllib.parse import urlparse
 
-import requests
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    InputMediaPhoto,
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -24,6 +17,7 @@ from telegram.ext import (
     filters,
     CallbackQueryHandler,
 )
+from telegram.request import HTTPXRequest
 import yt_dlp
 
 logging.basicConfig(
@@ -35,59 +29,56 @@ logger = logging.getLogger(__name__)
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me")
 APP_BASE_URL = os.getenv("APP_BASE_URL", "https://your-service.onrender.com")
+BOT_USERNAME = os.getenv("BOT_USERNAME", "")
 FORCE_GATE = os.getenv("FORCE_GATE", "1") == "1"
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing")
 
-app = FastAPI(title="Telegram TikTok Bot")
-telegram_app = Application.builder().token(BOT_TOKEN).build()
-PENDING = {}
+app = FastAPI(title="SnapTok Downloader FR v3")
 
+request = HTTPXRequest(
+    connection_pool_size=8,
+    read_timeout=60.0,
+    write_timeout=60.0,
+    connect_timeout=30.0,
+    pool_timeout=30.0,
+)
+telegram_app = Application.builder().token(BOT_TOKEN).request(request).build()
+
+PENDING = {}
 TIKTOK_RE = re.compile(r"(https?://)?(www\.)?(vm\.tiktok\.com|vt\.tiktok\.com|tiktok\.com)/", re.I)
+
+
+class UnsupportedPhotoPost(Exception):
+    pass
+
 
 def is_tiktok_url(text: str) -> bool:
     return bool(TIKTOK_RE.search(text or ""))
 
-def safe_name(name: str) -> str:
-    return re.sub(r'[^a-zA-Z0-9._ -]+', '_', name or "file")[:80].strip() or "file"
 
-def download_binary(url: str, suffix: str) -> str:
-    r = requests.get(url, timeout=30)
-    r.raise_for_status()
-    fd, temp_path = tempfile.mkstemp(suffix=suffix)
-    os.close(fd)
-    Path(temp_path).write_bytes(r.content)
-    return temp_path
+def normalize_url(url: str) -> str:
+    return (url or "").strip()
 
-def normalize_info(url: str) -> dict:
-    opts = {"skip_download": True, "quiet": True, "no_warnings": True, "noplaylist": True}
+
+def looks_like_photo_post(url: str) -> bool:
+    path = (urlparse(url).path or "").lower()
+    return "/photo/" in path
+
+
+def extract_info(url: str):
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "extract_flat": False,
+    }
     with yt_dlp.YoutubeDL(opts) as ydl:
         return ydl.extract_info(url, download=False)
 
-def collect_photo_urls(info: dict) -> List[str]:
-    urls = []
-    for key in ("thumbnails", "images"):
-        for item in info.get(key) or []:
-            u = item.get("url")
-            if isinstance(u, str) and u.startswith("http"):
-                urls.append(u)
-    for entry in info.get("entries") or []:
-        u = entry.get("url")
-        if isinstance(u, str) and u.startswith("http"):
-            urls.append(u)
-        for th in entry.get("thumbnails") or []:
-            tu = th.get("url")
-            if isinstance(tu, str) and tu.startswith("http"):
-                urls.append(tu)
-    seen, out = set(), []
-    for u in urls:
-        if u not in seen:
-            seen.add(u)
-            out.append(u)
-    return out
 
-def download_video_file(url: str) -> Tuple[str, str]:
+def ytdlp_download(url: str) -> tuple[str, str]:
     with tempfile.TemporaryDirectory() as tmpdir:
         outtmpl = str(Path(tmpdir) / "%(title).80s.%(ext)s")
         opts = {
@@ -97,152 +88,248 @@ def download_video_file(url: str) -> Tuple[str, str]:
             "merge_output_format": "mp4",
             "quiet": True,
             "no_warnings": True,
-            "http_headers": {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-            },
+            "retries": 3,
+            "fragment_retries": 3,
         }
         with yt_dlp.YoutubeDL(opts) as ydl:
             info = ydl.extract_info(url, download=True)
-            title = safe_name(info.get("title", "video"))
+            title = info.get("title", "vidéo")
             filepath = ydl.prepare_filename(info)
             if not os.path.exists(filepath):
-                alt = os.path.splitext(filepath)[0] + ".mp4"
+                base_no_ext = os.path.splitext(filepath)[0]
+                alt = base_no_ext + ".mp4"
                 if os.path.exists(alt):
                     filepath = alt
+
         suffix = Path(filepath).suffix or ".mp4"
         stable_fd, stable_path = tempfile.mkstemp(suffix=suffix)
         os.close(stable_fd)
         Path(stable_path).write_bytes(Path(filepath).read_bytes())
         return stable_path, title
 
+
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Bienvenue.\n\n"
-        "Envoie un lien TikTok public.\n"
-        "Le bot essaiera de récupérer la vidéo ou les images si le contenu est accessible."
+    text = (
+        "Que peut faire ce bot ?\n\n"
+        "Bot de téléchargement :\n\n"
+        "- vidéos TikTok sans filigrane\n"
+        "- photos TikTok\n"
+        "- musique\n"
+        "- stories\n\n"
+        "Appuie sur le bouton « Démarrer » 👇"
     )
+    await update.message.reply_text(text)
+
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Envoie un lien TikTok public, puis clique sur le bouton de déblocage.")
+    await update.message.reply_text(
+        "Bienvenue sur TikTok Downloader.\n\n"
+        "Avec ce bot, tu peux télécharger des vidéos TikTok sans filigrane.\n\n"
+        "Pour commencer le téléchargement, envoie simplement le lien de la vidéo TikTok."
+    )
+
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
+
     text = (update.message.text or "").strip()
     user_id = update.effective_user.id
+
+    if text.lower() == "/unlock":
+        await deliver_pending(update, context)
+        return
+
     if not is_tiktok_url(text):
         await update.message.reply_text("Envoie un vrai lien TikTok public.")
         return
+
     PENDING[user_id] = text
+
     if FORCE_GATE:
         gate_url = f"{APP_BASE_URL}/gate?uid={user_id}"
         kb = [
-            [InlineKeyboardButton("Débloquer le téléchargement", url=gate_url)],
-            [InlineKeyboardButton("J'ai terminé", callback_data="done_gate")],
+            [InlineKeyboardButton("👉 Voir la pub", url=gate_url)],
+            [InlineKeyboardButton("Passer", callback_data="done_gate")],
         ]
         await update.message.reply_text(
-            "Étape suivante : ouvre le bouton de déblocage. Ensuite reviens ici et appuie sur “J'ai terminé”.",
+            "Pour continuer, regardez une courte publicité (5 s)",
             reply_markup=InlineKeyboardMarkup(kb),
         )
     else:
         await process_and_send(update, context, text)
 
+
+async def deliver_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    url = PENDING.get(user_id)
+    if not url:
+        await update.message.reply_text("Aucun lien en attente.")
+        return
+    await process_and_send(update, context, url)
+
+
 async def process_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str):
     chat_id = update.effective_chat.id
-    user_id = update.effective_user.id
     status = await context.bot.send_message(chat_id=chat_id, text="Traitement en cours...")
-    temp_files = []
+
     try:
-        info = await asyncio.to_thread(normalize_info, url)
-        logger.info("extractor=%s title=%s", info.get("extractor"), info.get("title"))
-        photo_urls = collect_photo_urls(info)
-        is_probable_photo_post = "/photo/" in (info.get("webpage_url") or url) or (photo_urls and not info.get("duration"))
-        if is_probable_photo_post and photo_urls:
-            media = []
-            file_handles = []
-            for idx, photo_url in enumerate(photo_urls[:10], start=1):
-                try:
-                    p = await asyncio.to_thread(download_binary, photo_url, ".jpg")
-                    temp_files.append(p)
-                    fh = open(p, "rb")
-                    file_handles.append(fh)
-                    if idx == 1:
-                        media.append(InputMediaPhoto(media=fh, caption=f"Voici tes images : {safe_name(info.get('title', 'TikTok photo'))}"))
-                    else:
-                        media.append(InputMediaPhoto(media=fh))
-                except Exception:
-                    logger.exception("photo download failed")
-            if media:
-                await context.bot.send_media_group(chat_id=chat_id, media=media)
-                for fh in file_handles:
-                    fh.close()
-                PENDING.pop(user_id, None)
-                await status.delete()
-                return
-        file_path, title = await asyncio.to_thread(download_video_file, url)
-        temp_files.append(file_path)
+        url = normalize_url(url)
+        if looks_like_photo_post(url):
+            raise UnsupportedPhotoPost("photo post detected before download")
+
+        info = await asyncio.to_thread(extract_info, url)
+        webpage_url = info.get("webpage_url") or url
+        title = info.get("title", "vidéo")
+        logger.info("extractor=%s title=%s", info.get("extractor"), title)
+
+        if looks_like_photo_post(webpage_url):
+            raise UnsupportedPhotoPost("photo post detected after extract")
+
+        file_path, title = await asyncio.to_thread(ytdlp_download, webpage_url)
+
         with open(file_path, "rb") as f:
             await context.bot.send_document(
                 chat_id=chat_id,
                 document=f,
-                filename=f"{title}{Path(file_path).suffix or '.mp4'}",
-                caption=f"Voici ton fichier : {title}",
+                filename=Path(file_path).name,
+                caption=f"Voici ton fichier : {title}"
             )
-        PENDING.pop(user_id, None)
-        await status.delete()
+
+        try:
+            os.remove(file_path)
+        except OSError:
+            pass
+
+        PENDING.pop(update.effective_user.id, None)
+        try:
+            await status.delete()
+        except Exception:
+            pass
+
+    except UnsupportedPhotoPost:
+        logger.warning("photo post unsupported url=%s", url)
+        try:
+            await status.edit_text(
+                "Ce lien TikTok correspond à un post photo. "
+                "La récupération des photos n'est pas encore activée dans cette version."
+            )
+        except Exception:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="Ce lien TikTok correspond à un post photo. La récupération des photos n'est pas encore activée dans cette version."
+            )
+
     except Exception:
         logger.exception("download failed url=%s", url)
-        await status.edit_text(
-            "Échec du téléchargement.\n\n"
-            "Causes possibles :\n"
-            "1) ce lien précis n'est pas bien géré,\n"
-            "2) c'est un post photo/slide spécial,\n"
-            "3) TikTok bloque temporairement ce média,\n"
-            "4) le service Render gratuit est en réveil ou lent.\n\n"
-            "Ouvre les logs Render pour voir l'erreur exacte."
-        )
-    finally:
-        for p in temp_files:
-            try:
-                os.remove(p)
-            except Exception:
-                pass
+        try:
+            await status.edit_text(
+                "Échec du téléchargement. Vérifie que le lien est public, accessible et que le format est supporté."
+            )
+        except Exception:
+            await context.bot.send_message(
+                chat_id=chat_id,
+                text="Échec du téléchargement. Vérifie que le lien est public, accessible et que le format est supporté."
+            )
+
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     if query.data == "done_gate":
-        url = PENDING.get(query.from_user.id)
+        user_id = query.from_user.id
+        url = PENDING.get(user_id)
+        if not url:
+            await query.message.reply_text("Aucun lien en attente.")
+            return
+
+        kb = [[InlineKeyboardButton("Continuer", callback_data="continue_download")]]
+        await query.message.reply_text(
+            "Téléchargement débloqué.\nAppuie sur « Continuer » pour récupérer ton fichier.",
+            reply_markup=InlineKeyboardMarkup(kb),
+        )
+
+    elif query.data == "continue_download":
+        user_id = query.from_user.id
+        url = PENDING.get(user_id)
         if not url:
             await query.message.reply_text("Aucun lien en attente.")
             return
         await process_and_send(update, context, url)
 
+
 @app.get("/", response_class=HTMLResponse)
 async def root():
-    return "<h2>Telegram TikTok Bot</h2><p>Service actif.</p>"
+    return "<h2>SnapTok Downloader FR v3</h2><p>Service en ligne.</p>"
+
 
 @app.get("/health")
 async def health():
     return {"ok": True}
 
+
 @app.get("/gate", response_class=HTMLResponse)
 async def gate(uid: int):
-    unlock_link = "tg://resolve?domain={}".format(os.getenv("BOT_USERNAME", ""))
-    html = f'''
+    unlock_link = f"tg://resolve?domain={BOT_USERNAME}"
+    html = f"""
     <!DOCTYPE html>
     <html lang="fr">
-    <head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/>
-    <title>Déblocage</title></head>
-    <body style="font-family:Arial;max-width:720px;margin:40px auto;padding:16px">
-      <div style="border:1px solid #ddd;border-radius:10px;padding:20px">
-        <h1>Déblocage</h1>
-        <p>Place ici ton code publicitaire ou ton message sponsor.</p>
-        <p>Ensuite retourne au bot et clique sur “J'ai terminé”.</p>
-        <a href="{unlock_link}" style="display:inline-block;padding:12px 18px;background:#111;color:#fff;text-decoration:none;border-radius:8px">Retourner au bot</a>
+    <head>
+      <meta charset="utf-8"/>
+      <meta name="viewport" content="width=device-width,initial-scale=1"/>
+      <title>Déblocage du téléchargement</title>
+      <style>
+        body {{
+          font-family: Arial, sans-serif;
+          background: #17212b;
+          color: white;
+          max-width: 700px;
+          margin: 0 auto;
+          padding: 24px;
+        }}
+        .card {{
+          background: #1f2c3a;
+          border-radius: 20px;
+          padding: 20px;
+          margin-top: 24px;
+        }}
+        .small {{
+          opacity: 0.9;
+          text-align: center;
+          margin-top: 18px;
+        }}
+        .btn {{
+          display: block;
+          width: 100%;
+          text-align: center;
+          padding: 18px 20px;
+          background: #4b78a8;
+          color: white;
+          text-decoration: none;
+          border-radius: 18px;
+          font-size: 18px;
+          margin-top: 24px;
+          box-sizing: border-box;
+        }}
+        .badge {{
+          text-align: center;
+          margin-top: 18px;
+          font-size: 14px;
+          opacity: 0.9;
+        }}
+      </style>
+    </head>
+    <body>
+      <div class="card">
+        <div style="height:160px;background:#000;border-radius:16px;"></div>
+        <div class="badge">ads by Monetag</div>
+        <a class="btn" href="{unlock_link}">Continue</a>
       </div>
-    </body></html>'''
+    </body>
+    </html>
+    """
     return HTMLResponse(content=html)
+
 
 @app.post("/webhook/{secret}")
 async def telegram_webhook(secret: str, request: Request):
@@ -253,6 +340,7 @@ async def telegram_webhook(secret: str, request: Request):
     await telegram_app.process_update(update)
     return JSONResponse({"ok": True})
 
+
 async def setup_bot():
     telegram_app.add_handler(CommandHandler("start", start_cmd))
     telegram_app.add_handler(CommandHandler("help", help_cmd))
@@ -260,6 +348,7 @@ async def setup_bot():
     telegram_app.add_handler(CallbackQueryHandler(button_handler))
     await telegram_app.initialize()
     await telegram_app.start()
+
 
 @app.on_event("startup")
 async def on_startup():
