@@ -9,33 +9,25 @@ from urllib.parse import urlparse
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    filters,
-    CallbackQueryHandler,
-)
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters, CallbackQueryHandler
 from telegram.request import HTTPXRequest
 import yt_dlp
 
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
+logging.basicConfig(format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me")
 APP_BASE_URL = os.getenv("APP_BASE_URL", "https://your-service.onrender.com")
-BOT_USERNAME = os.getenv("BOT_USERNAME", "")
+BOT_USERNAME = os.getenv("BOT_USERNAME", "downloader_snaptok_bot")
 FORCE_GATE = os.getenv("FORCE_GATE", "1") == "1"
+MONETAG_ZONE = os.getenv("MONETAG_ZONE", "10883059")
+MONETAG_SCRIPT_SRC = os.getenv("MONETAG_SCRIPT_SRC", "//libtl.com/sdk.js")
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is missing")
 
-app = FastAPI(title="SnapTok Downloader FR v3")
+app = FastAPI(title="SnapTok Downloader FR v3.1")
 
 request = HTTPXRequest(
     connection_pool_size=8,
@@ -49,36 +41,25 @@ telegram_app = Application.builder().token(BOT_TOKEN).request(request).build()
 PENDING = {}
 TIKTOK_RE = re.compile(r"(https?://)?(www\.)?(vm\.tiktok\.com|vt\.tiktok\.com|tiktok\.com)/", re.I)
 
-
 class UnsupportedPhotoPost(Exception):
     pass
-
 
 def is_tiktok_url(text: str) -> bool:
     return bool(TIKTOK_RE.search(text or ""))
 
-
 def normalize_url(url: str) -> str:
     return (url or "").strip()
-
 
 def looks_like_photo_post(url: str) -> bool:
     path = (urlparse(url).path or "").lower()
     return "/photo/" in path
 
-
 def extract_info(url: str):
-    opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "noplaylist": True,
-        "extract_flat": False,
-    }
+    opts = {"quiet": True, "no_warnings": True, "noplaylist": True, "extract_flat": False}
     with yt_dlp.YoutubeDL(opts) as ydl:
         return ydl.extract_info(url, download=False)
 
-
-def ytdlp_download(url: str) -> tuple[str, str]:
+def ytdlp_download(url: str):
     with tempfile.TemporaryDirectory() as tmpdir:
         outtmpl = str(Path(tmpdir) / "%(title).80s.%(ext)s")
         opts = {
@@ -107,7 +88,6 @@ def ytdlp_download(url: str) -> tuple[str, str]:
         Path(stable_path).write_bytes(Path(filepath).read_bytes())
         return stable_path, title
 
-
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "Bienvenue sur TikTok Downloader.\n\n"
@@ -116,14 +96,12 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.message.reply_text(text)
 
-
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Bienvenue sur TikTok Downloader.\n\n"
-        "Avec ce bot, tu peux télécharger des vidéos TikTok sans filigrane.\n\n"
-        "Pour commencer le téléchargement, envoie simplement le lien de la vidéo TikTok."
+        "En utilisant ce robot, vous pouvez télécharger des vidéos TikTok sans filigrane.\n\n"
+        "Pour commencer le téléchargement, il suffit de soumettre le lien vers la vidéo TikTok."
     )
-
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
@@ -155,7 +133,6 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await process_and_send(update, context, text)
 
-
 async def deliver_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     url = PENDING.get(user_id)
@@ -163,7 +140,6 @@ async def deliver_pending(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Aucun lien en attente.")
         return
     await process_and_send(update, context, url)
-
 
 async def process_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str):
     chat_id = update.effective_chat.id
@@ -176,20 +152,19 @@ async def process_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, u
 
         info = await asyncio.to_thread(extract_info, url)
         webpage_url = info.get("webpage_url") or url
-        title = info.get("title", "vidéo")
-        logger.info("extractor=%s title=%s", info.get("extractor"), title)
 
         if looks_like_photo_post(webpage_url):
             raise UnsupportedPhotoPost("photo post detected after extract")
 
-        file_path, title = await asyncio.to_thread(ytdlp_download, webpage_url)
+        file_path, _title = await asyncio.to_thread(ytdlp_download, webpage_url)
 
+        caption = f"Downloaded via:\n@{BOT_USERNAME}"
         with open(file_path, "rb") as f:
             await context.bot.send_document(
                 chat_id=chat_id,
                 document=f,
                 filename=Path(file_path).name,
-                caption=f"Voici ton fichier : {title}"
+                caption=caption
             )
 
         try:
@@ -208,12 +183,12 @@ async def process_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, u
         try:
             await status.edit_text(
                 "Ce lien TikTok correspond à un post photo. "
-                "La récupération des photos n'est pas encore activée dans cette version."
+                "La récupération des photos sera ajoutée dans la prochaine version."
             )
         except Exception:
             await context.bot.send_message(
                 chat_id=chat_id,
-                text="Ce lien TikTok correspond à un post photo. La récupération des photos n'est pas encore activée dans cette version."
+                text="Ce lien TikTok correspond à un post photo. La récupération des photos sera ajoutée dans la prochaine version."
             )
 
     except Exception:
@@ -227,7 +202,6 @@ async def process_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE, u
                 chat_id=chat_id,
                 text="Échec du téléchargement. Vérifie que le lien est public, accessible et que le format est supporté."
             )
-
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -253,27 +227,30 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         await process_and_send(update, context, url)
 
-
 @app.get("/", response_class=HTMLResponse)
 async def root():
-    return "<h2>SnapTok Downloader FR v3</h2><p>Service en ligne.</p>"
-
+    return "<h2>SnapTok Downloader FR v3.1</h2><p>Service en ligne.</p>"
 
 @app.get("/health")
 async def health():
     return {"ok": True}
 
-
 @app.get("/gate", response_class=HTMLResponse)
 async def gate(uid: int):
-    unlock_link = f"tg://resolve?domain={BOT_USERNAME}"
-    html = f"""
+    script_loader = (
+        f"<script src='{MONETAG_SCRIPT_SRC}' data-zone='{MONETAG_ZONE}' "
+        f"data-sdk='show_{MONETAG_ZONE}'></script>"
+    )
+    show_fn = f"show_{MONETAG_ZONE}"
+
+    html = f'''
     <!DOCTYPE html>
     <html lang="fr">
     <head>
       <meta charset="utf-8"/>
       <meta name="viewport" content="width=device-width,initial-scale=1"/>
       <title>Déblocage du téléchargement</title>
+      {script_loader}
       <style>
         body {{
           font-family: Arial, sans-serif;
@@ -289,23 +266,27 @@ async def gate(uid: int):
           padding: 20px;
           margin-top: 24px;
         }}
-        .small {{
-          opacity: 0.9;
-          text-align: center;
-          margin-top: 18px;
-        }}
         .btn {{
           display: block;
           width: 100%;
           text-align: center;
           padding: 18px 20px;
+          border: 0;
           background: #4b78a8;
           color: white;
           text-decoration: none;
           border-radius: 18px;
           font-size: 18px;
-          margin-top: 24px;
+          margin-top: 18px;
           box-sizing: border-box;
+          cursor: pointer;
+        }}
+        .btn.secondary {{
+          background: #2d4052;
+        }}
+        .btn[disabled] {{
+          opacity: .55;
+          cursor: not-allowed;
         }}
         .badge {{
           text-align: center;
@@ -313,19 +294,59 @@ async def gate(uid: int):
           font-size: 14px;
           opacity: 0.9;
         }}
+        .title {{
+          font-size: 24px;
+          font-weight: 700;
+          margin-bottom: 12px;
+        }}
+        .desc {{
+          line-height: 1.5;
+          opacity: .95;
+        }}
+        .status {{
+          text-align: center;
+          margin-top: 14px;
+          min-height: 22px;
+          opacity: .9;
+        }}
       </style>
     </head>
     <body>
       <div class="card">
-        <div style="height:160px;background:#000;border-radius:16px;"></div>
+        <div class="title">Déblocage du téléchargement</div>
+        <div class="desc">Regarde une courte publicité pour débloquer ton téléchargement.</div>
         <div class="badge">ads by Monetag</div>
-        <a class="btn" href="{unlock_link}">Continue</a>
+        <button id="watchAdBtn" class="btn">👉 Voir la pub</button>
+        <a id="continueBtn" class="btn secondary" href="tg://resolve?domain={BOT_USERNAME}" style="display:none;">Continuer</a>
+        <div id="statusText" class="status"></div>
       </div>
+
+      <script>
+        const watchBtn = document.getElementById("watchAdBtn");
+        const continueBtn = document.getElementById("continueBtn");
+        const statusText = document.getElementById("statusText");
+
+        function unlockContinue() {{
+          watchBtn.disabled = true;
+          watchBtn.innerText = "Publicité vue";
+          continueBtn.style.display = "block";
+          statusText.innerText = "Téléchargement débloqué. Retourne au bot puis appuie sur Continuer.";
+        }}
+
+        watchBtn.addEventListener("click", async () => {{
+          statusText.innerText = "Chargement de la publicité...";
+          try {{
+            await {show_fn}();
+            unlockContinue();
+          }} catch (e) {{
+            statusText.innerText = "La publicité n'a pas pu s'afficher. Réessaie.";
+          }}
+        }});
+      </script>
     </body>
     </html>
-    """
+    '''
     return HTMLResponse(content=html)
-
 
 @app.post("/webhook/{secret}")
 async def telegram_webhook(secret: str, request: Request):
@@ -336,7 +357,6 @@ async def telegram_webhook(secret: str, request: Request):
     await telegram_app.process_update(update)
     return JSONResponse({"ok": True})
 
-
 async def setup_bot():
     telegram_app.add_handler(CommandHandler("start", start_cmd))
     telegram_app.add_handler(CommandHandler("help", help_cmd))
@@ -344,7 +364,6 @@ async def setup_bot():
     telegram_app.add_handler(CallbackQueryHandler(button_handler))
     await telegram_app.initialize()
     await telegram_app.start()
-
 
 @app.on_event("startup")
 async def on_startup():
