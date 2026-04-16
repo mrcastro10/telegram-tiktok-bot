@@ -110,13 +110,9 @@ def ytdlp_download(url: str) -> tuple[str, str]:
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
-        "Que peut faire ce bot ?\n\n"
-        "Bot de téléchargement :\n\n"
-        "- vidéos TikTok sans filigrane\n"
-        "- photos TikTok\n"
-        "- musique\n"
-        "- stories\n\n"
-        "Appuie sur le bouton « Démarrer » 👇"
+        "Bienvenue sur TikTok Downloader.\n\n"
+        "En utilisant ce robot, vous pouvez télécharger des vidéos TikTok sans filigrane.\n\n"
+        "Pour commencer le téléchargement, il suffit de soumettre le lien vers la vidéo TikTok."
     )
     await update.message.reply_text(text)
 
